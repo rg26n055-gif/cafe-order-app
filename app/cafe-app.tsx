@@ -1,4 +1,5 @@
 'use client';
+import { firebaseAuth } from '../lib/firebase-client';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { catalog, type Store, type Product, type Order } from '../lib/catalog';
 const tabs=['注文受付','会計','厨房','綿あめ','在庫'] as const;
@@ -8,14 +9,19 @@ const yen=(n:number)=>'¥'+n.toLocaleString('ja-JP');
 const clock=(value:string)=>new Date(value).toLocaleTimeString('ja-JP',{timeZone:'Asia/Tokyo',hour:'2-digit',minute:'2-digit'});
 const day=(value:string)=>new Date(value).toLocaleDateString('ja-JP',{timeZone:'Asia/Tokyo'});
 const labels:Record<string,string>={unpaid:'未会計',paid:'準備中',delivered:'提供済み',cancelled:'取消済み'};
-const PENDING_KEY='cafe.pending-order.v1';
-async function api(url:string,method='GET',body?:unknown){
- const response=await fetch(url,{method,cache:'no-store',headers:method==='GET'?{}:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
+async function authenticatedApi(userId:string,url:string,method='GET',body?:unknown){
+ const user=firebaseAuth().currentUser;
+ if(!user||user.uid!==userId)throw new Error('アカウントが変更されました。ログインし直してください。');
+ const token=await user.getIdToken();
+ if(firebaseAuth().currentUser?.uid!==userId)throw new Error('アカウントが変更されました。');
+ const response=await fetch(url,{method,cache:'no-store',headers:{'Authorization':'Bearer '+token,...(method==='GET'?{}:{'Content-Type':'application/json'})},body:body?JSON.stringify(body):undefined});
  let data:any;try{data=await response.json();}catch{throw new Error('サーバーから応答を受け取れませんでした。再試行してください。');}
  if(!response.ok){const error=new Error(data.error||'処理できませんでした。') as Error&{status:number};error.status=response.status;throw error;}
  return data;
 }
-export default function CafeApp({userName}:{userName:string}){
+export default function CafeApp({userName,userId,onLogout}:{userName:string;userId:string;onLogout:()=>Promise<void>}){
+ const PENDING_KEY='cafe.pending-order.v2.'+userId;
+ const api=useCallback((url:string,method='GET',body?:unknown)=>authenticatedApi(userId,url,method,body),[userId]);
  const [tab,setTab]=useState<Tab>('注文受付'),[store,setStore]=useState<Store|null>(null);
  const [loadError,setLoadError]=useState(''),[error,setError]=useState(''),[message,setMessage]=useState(''),[busy,setBusy]=useState(false);
  const [usage,setUsage]=useState('店内飲食'),[ticket,setTicket]=useState('前売り券'),[number,setNumber]=useState('');
@@ -28,14 +34,14 @@ export default function CafeApp({userName}:{userName:string}){
   const version=++generation.current;
   try{const data=await api('/api/store');if(version===generation.current){setStore(data);setLoadError('');}}
   catch(e){if(version===generation.current)setLoadError((e as Error).message);}
- },[]);
+ },[api]);
  useEffect(()=>{
   try{const raw=sessionStorage.getItem(PENDING_KEY);if(raw){const d=JSON.parse(raw) as Draft;if(d.id&&Array.isArray(d.items)){pendingRef.current=d;setPending(d);setUsage(d.usageType);setTicket(d.ticketType);setNumber(String(d.customerNumber));setQuantities(Object.fromEntries(d.items.map(i=>[i.productId,i.qty])));}}}catch{}
   setReady(true);refresh();
   const interval=setInterval(()=>{if(!actionLock.current&&!pollLock.current){pollLock.current=true;refresh().finally(()=>pollLock.current=false);}},10000);
   const focus=()=>{if(!actionLock.current)refresh();};window.addEventListener('focus',focus);
   return ()=>{clearInterval(interval);window.removeEventListener('focus',focus);generation.current++;};
- },[refresh]);
+ },[refresh,PENDING_KEY]);
  useEffect(()=>{
   const context=(document as Document & {modelContext?:{registerTool:(tool:object,options:{signal:AbortSignal})=>void|Promise<void>}}).modelContext;
   if(!context?.registerTool)return;
@@ -44,7 +50,7 @@ export default function CafeApp({userName}:{userName:string}){
   register({name:'read_cafe_status',title:'カフェの稼働状況を確認',description:'最新の在庫と未会計・提供待ちの件数を読み取る。注文を変更しない。',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true,untrustedContentHint:true},execute:async(input:unknown)=>{if(!input||typeof input!=='object'||Object.keys(input).length)throw new Error('引数は空のオブジェクトにしてください。');const data:Store=await api('/api/store');return {products:data.products,unpaid:data.orders.filter(o=>o.status==='unpaid').length,waiting:data.orders.filter(o=>o.status==='paid').length};}});
   register({name:'open_cafe_section',title:'業務画面を開く',description:'注文受付・会計・厨房・綿あめ・在庫の画面を開く。注文の登録や会計処理は行わない。',inputSchema:{type:'object',properties:{section:{type:'string',enum:[...tabs]}},required:['section'],additionalProperties:false},annotations:{readOnlyHint:false,untrustedContentHint:false},execute:async(input:unknown)=>{const value=input as {section?:Tab};if(!value||!tabs.includes(value.section as Tab)||Object.keys(value).some(k=>k!=='section'))throw new Error('画面名が正しくありません。');setTab(value.section!);await new Promise<void>(resolve=>requestAnimationFrame(()=>resolve()));return {section:value.section};}});
   return ()=>lifecycle.abort();
- },[]);
+ },[api]);
  const products=store?.products||[];
  const orders=store?.orders||[];
  const active=orders.filter(o=>o.status==='paid');
@@ -76,7 +82,7 @@ export default function CafeApp({userName}:{userName:string}){
  function ask(order:Order,action:string){setConfirmAction({title:action==='pay'?'会計済みにしますか？':action==='cancel'?'この注文を取り消しますか？':'提供済みにしますか？',description:`${order.usageType}・お客様番号 ${order.customerNumber} ／ ${yen(order.total)}${action==='pay'?'。代金・チケットを受け取ったことを確認してください。':action==='cancel'?'。予約していた在庫を戻します。':'。すべての商品をお渡ししたことを確認してください。'}`,run:()=>orderAction(order,action)});}
  const ordered=orders.filter(o=>filter==='all'||o.status===filter);
  return <div className="shell">
-  <aside className="sidebar"><div className="brand"><span className="brand-symbol">c.</span><div><strong>CAFE ORDER</strong><small>スタッフワークスペース</small></div></div><nav aria-label="業務メニュー">{tabs.map((t,i)=><button type="button" aria-current={tab===t?'page':undefined} className={tab===t?'selected':''} onClick={()=>{setTab(t);setError('');}} key={t}><span aria-hidden="true">{['＋','¥','▤','◉','▦'][i]}</span>{t}{t==='会計'&&unpaid.length>0&&<b>{unpaid.length}</b>}{t==='厨房'&&active.length>0&&<b>{active.length}</b>}</button>)}</nav><div className="staff"><span className="avatar">S</span><div><strong>スタッフ</strong><small title={userName}>{userName}</small><a href="/signout-with-chatgpt?return_to=/" target="_top">ログアウト</a></div></div></aside>
+  <aside className="sidebar"><div className="brand"><span className="brand-symbol">c.</span><div><strong>CAFE ORDER</strong><small>あなた専用のワークスペース</small></div></div><nav aria-label="業務メニュー">{tabs.map((t,i)=><button type="button" aria-current={tab===t?'page':undefined} className={tab===t?'selected':''} onClick={()=>{setTab(t);setError('');}} key={t}><span aria-hidden="true">{['＋','¥','▤','◉','▦'][i]}</span>{t}{t==='会計'&&unpaid.length>0&&<b>{unpaid.length}</b>}{t==='厨房'&&active.length>0&&<b>{active.length}</b>}</button>)}</nav><div className="staff"><span className="avatar">S</span><div><strong>ログイン中</strong><small title={userName}>{userName}</small><button className="text-button" disabled={busy} onClick={()=>onLogout().catch(e=>setError(e.message))}>ログアウト</button></div></div></aside>
   <main className="workspace"><header><div><p className="eyebrow">CAFE WORKSPACE</p><h1>{tab}</h1></div><div className="header-actions"><span className="sync">{store?`${clock(store.updatedAt)} 更新`:'接続中…'}</span><button className="secondary" disabled={busy} onClick={refresh}>↻ 更新</button></div></header>
   <div className="stats"><div><span>未会計</span><strong>{unpaid.length}<small>件</small></strong></div><div><span>提供待ち</span><strong>{active.length}<small>件</small></strong></div><div><span>本日の会計済み金額</span><strong>{yen(sales)}</strong></div></div>
   {loadError&&<div className="alert" role="alert">{loadError} <button onClick={refresh}>再読み込み</button></div>}

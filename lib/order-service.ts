@@ -20,19 +20,19 @@ export async function createOrder(db:D1Database,userId:string,input:any) {
   const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(normalized));
   const hash=Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,'0')).join('');
   const existing=async()=>{
-    const row=await db.prepare('SELECT id,request_hash,created_by FROM orders WHERE id=?').bind(input.id).first<{id:string;request_hash:string;created_by:string}>();
+    const row=await db.prepare('SELECT id,request_hash,created_by FROM account_orders WHERE owner_id=? AND id=?').bind(userId,input.id).first<{id:string;request_hash:string;created_by:string}>();
     if(row&&(row.request_hash!==hash||row.created_by!==userId))throw new ServiceError('同じ注文番号に異なる内容は登録できません。',409);
     return row;
   };
   if(await existing())return {id:input.id,repeated:true};
-  const products=(await db.prepare('SELECT * FROM products').all<Product>()).results;
+  const products=(await db.prepare('SELECT * FROM account_products WHERE owner_id=?').bind(userId).all<Product>()).results;
   for(const item of items){const p=products.find(p=>p.id===item.productId);if(!p)throw new ServiceError('選択された商品は存在しません。');if(p.stock<item.qty)throw new ServiceError(`${p.name}の在庫が不足しています（残り${p.stock}個）。`,409);}
   const now=new Date().toISOString();
-  const statements=[db.prepare('INSERT INTO orders (id,usage_type,ticket_type,customer_number,status,created_at,created_by,request_hash) VALUES (?,?,?,?,?,?,?,?)').bind(input.id,input.usageType,input.ticketType,input.customerNumber,'unpaid',now,userId,hash)];
+  const statements=[db.prepare('INSERT INTO account_orders (owner_id,id,usage_type,ticket_type,customer_number,status,created_at,created_by,request_hash) VALUES (?,?,?,?,?,?,?,?,?)').bind(userId,input.id,input.usageType,input.ticketType,input.customerNumber,'unpaid',now,userId,hash)];
   for(const item of items){
     // Server-side prices are snapshotted, never trusted from the browser.
-    statements.push(db.prepare('INSERT INTO order_items (order_id,product_id,name,price,qty,station) SELECT ?,id,name,price,?,station FROM products WHERE id=?').bind(input.id,item.qty,item.productId));
-    statements.push(db.prepare('UPDATE products SET stock=stock-? WHERE id=?').bind(item.qty,item.productId));
+    statements.push(db.prepare('INSERT INTO account_items (owner_id,order_id,product_id,name,price,qty,station) SELECT owner_id,?,id,name,price,?,station FROM account_products WHERE owner_id=? AND id=?').bind(input.id,item.qty,userId,item.productId));
+    statements.push(db.prepare('UPDATE account_products SET stock=stock-? WHERE owner_id=? AND id=?').bind(item.qty,userId,item.productId));
   }
   try{await db.batch(statements);}catch(error){
     if(await existing())return {id:input.id,repeated:true};
@@ -41,53 +41,53 @@ export async function createOrder(db:D1Database,userId:string,input:any) {
   }
   return {id:input.id,repeated:false};
 }
-export async function changeOrder(db:D1Database,id:string,input:any) {
+export async function changeOrder(db:D1Database,userId:string,id:string,input:any) {
   if(!isId(id)||!input)throw new ServiceError('注文番号が不正です。');
-  const order=await db.prepare('SELECT status FROM orders WHERE id=?').bind(id).first<{status:string}>();
+  const order=await db.prepare('SELECT status FROM account_orders WHERE owner_id=? AND id=?').bind(userId,id).first<{status:string}>();
   if(!order)throw new ServiceError('注文が見つかりません。',404);
   const now=new Date().toISOString();
   if(input.action==='pay'){
     if(['paid','delivered'].includes(order.status))return;
     if(order.status!=='unpaid')throw new ServiceError('取り消した注文は会計できません。',409);
     const results=await db.batch([
-      db.prepare("UPDATE orders SET status='paid',paid_at=? WHERE id=? AND status='unpaid'").bind(now,id),
-      db.prepare("UPDATE order_items SET done_at=COALESCE(done_at,?) WHERE order_id=? AND station='pack' AND EXISTS (SELECT 1 FROM orders WHERE id=? AND status='paid')").bind(now,id,id),
+      db.prepare("UPDATE account_orders SET status='paid',paid_at=? WHERE owner_id=? AND id=? AND status='unpaid'").bind(now,userId,id),
+      db.prepare("UPDATE account_items SET done_at=COALESCE(done_at,?) WHERE owner_id=? AND order_id=? AND station='pack' AND EXISTS (SELECT 1 FROM account_orders o WHERE o.owner_id=account_items.owner_id AND o.id=account_items.order_id AND status='paid')").bind(now,userId,id),
     ]);
-    if(!results[0].meta.changes) {const after=await db.prepare('SELECT status FROM orders WHERE id=?').bind(id).first<{status:string}>();if(!['paid','delivered'].includes(after?.status||''))throw new ServiceError('注文の状態が変わりました。更新して確認してください。',409);}
+    if(!results[0].meta.changes) {const after=await db.prepare('SELECT status FROM account_orders WHERE owner_id=? AND id=?').bind(userId,id).first<{status:string}>();if(!['paid','delivered'].includes(after?.status||''))throw new ServiceError('注文の状態が変わりました。更新して確認してください。',409);}
     return;
   }
   if(input.action==='prepare'){
     if(!['kitchen','float'].includes(input.station))throw new ServiceError('担当が不正です。');
     if(order.status!=='paid')throw new ServiceError('会計済みの注文だけ調理完了にできます。',409);
-    const result=await db.prepare("UPDATE order_items SET done_at=COALESCE(done_at,?) WHERE order_id=? AND station=? AND EXISTS (SELECT 1 FROM orders WHERE id=? AND status='paid')").bind(now,id,input.station,id).run();
+    const result=await db.prepare("UPDATE account_items SET done_at=COALESCE(done_at,?) WHERE owner_id=? AND order_id=? AND station=? AND EXISTS (SELECT 1 FROM account_orders o WHERE o.owner_id=account_items.owner_id AND o.id=account_items.order_id AND status='paid')").bind(now,userId,id,input.station).run();
     if(!result.meta.changes)throw new ServiceError('対象の調理品がないか、注文の状態が変わりました。',409);
     return;
   }
   if(input.action==='deliver'){
     if(order.status==='delivered')return;
-    const result=await db.prepare("UPDATE orders SET status='delivered',delivered_at=? WHERE id=? AND status='paid' AND NOT EXISTS (SELECT 1 FROM order_items WHERE order_id=? AND done_at IS NULL)").bind(now,id,id).run();
+    const result=await db.prepare("UPDATE account_orders SET status='delivered',delivered_at=? WHERE owner_id=? AND id=? AND status='paid' AND NOT EXISTS (SELECT 1 FROM account_items i WHERE i.owner_id=account_orders.owner_id AND i.order_id=account_orders.id AND done_at IS NULL)").bind(now,userId,id).run();
     if(!result.meta.changes)throw new ServiceError('会計と、すべての商品の調理完了を確認してください。',409);
     return;
   }
   if(input.action==='cancel'){
     if(!isId(input.operationId))throw new ServiceError('操作番号が不正です。');
-    const prior=await db.prepare('SELECT type,order_id FROM operations WHERE id=?').bind(input.operationId).first<{type:string;order_id:string}>();
+    const prior=await db.prepare('SELECT type,order_id FROM account_operations WHERE owner_id=? AND id=?').bind(userId,input.operationId).first<{type:string;order_id:string}>();
     if(prior){if(prior.type!=='cancel'||prior.order_id!==id)throw new ServiceError('操作番号が重複しています。',409);return;}
     if(order.status==='cancelled')return;
     if(order.status!=='unpaid')throw new ServiceError('取り消せるのは未会計の注文だけです。',409);
     try{await db.batch([
-      db.prepare("INSERT INTO operations (id,type,order_id,created_at) SELECT ?,'cancel',id,? FROM orders WHERE id=? AND status='unpaid'").bind(input.operationId,now,id),
-      db.prepare('UPDATE products SET stock=stock+(SELECT SUM(qty) FROM order_items WHERE order_id=? AND product_id=products.id) WHERE id IN (SELECT product_id FROM order_items WHERE order_id=?) AND EXISTS (SELECT 1 FROM operations WHERE id=?)').bind(id,id,input.operationId),
-      db.prepare("UPDATE orders SET status='cancelled',cancelled_at=? WHERE id=? AND EXISTS (SELECT 1 FROM operations WHERE id=?)").bind(now,id,input.operationId),
-    ]);}catch(error){const done=await db.prepare('SELECT type,order_id FROM operations WHERE id=?').bind(input.operationId).first<{type:string;order_id:string}>();if(done?.type==='cancel'&&done.order_id===id)return;throw error;}
-    const after=await db.prepare('SELECT status FROM orders WHERE id=?').bind(id).first<{status:string}>();
+      db.prepare("INSERT INTO account_operations (owner_id,id,type,order_id,created_at) SELECT owner_id,?,'cancel',id,? FROM account_orders WHERE owner_id=? AND id=? AND status='unpaid'").bind(input.operationId,now,userId,id),
+      db.prepare('UPDATE account_products SET stock=stock+(SELECT SUM(qty) FROM account_items i WHERE i.owner_id=account_products.owner_id AND order_id=? AND product_id=account_products.id) WHERE owner_id=? AND id IN (SELECT product_id FROM account_items WHERE owner_id=? AND order_id=?) AND EXISTS (SELECT 1 FROM account_operations WHERE owner_id=? AND id=?)').bind(id,userId,userId,id,userId,input.operationId),
+      db.prepare("UPDATE account_orders SET status='cancelled',cancelled_at=? WHERE owner_id=? AND id=? AND EXISTS (SELECT 1 FROM account_operations op WHERE op.owner_id=account_orders.owner_id AND op.order_id=account_orders.id AND op.id=?)").bind(now,userId,id,input.operationId),
+    ]);}catch(error){const done=await db.prepare('SELECT type,order_id FROM account_operations WHERE owner_id=? AND id=?').bind(userId,input.operationId).first<{type:string;order_id:string}>();if(done?.type==='cancel'&&done.order_id===id)return;throw error;}
+    const after=await db.prepare('SELECT status FROM account_orders WHERE owner_id=? AND id=?').bind(userId,id).first<{status:string}>();
     if(after?.status!=='cancelled')throw new ServiceError('会計済みになったため取り消せません。',409);
     return;
   }
   throw new ServiceError('指定された操作はありません。');
 }
-export async function setStock(db:D1Database,id:string,input:any) {
+export async function setStock(db:D1Database,userId:string,id:string,input:any) {
   if(!input||!Number.isInteger(input.stock)||input.stock<0||input.stock>9999||!Number.isInteger(input.expectedStock))throw new ServiceError('在庫は0〜9999の整数で入力してください。');
-  const result=await db.prepare('UPDATE products SET stock=? WHERE id=? AND stock=?').bind(input.stock,id,input.expectedStock).run();
+  const result=await db.prepare('UPDATE account_products SET stock=? WHERE owner_id=? AND id=? AND stock=?').bind(input.stock,userId,id,input.expectedStock).run();
   if(!result.meta.changes)throw new ServiceError('在庫が他の端末で更新されました。最新の在庫を確認して入力し直してください。',409);
 }
